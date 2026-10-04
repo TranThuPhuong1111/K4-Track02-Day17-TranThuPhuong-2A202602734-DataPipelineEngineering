@@ -18,6 +18,7 @@ real model (swap in any provider via .env if you like — the pipeline is the sa
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -80,14 +81,60 @@ def live_tickets(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
     """).fetchall()
 
 
+def input_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def label_tickets(con: duckdb.DuckDBPyConnection, llm: FakeLLM) -> dict:
-    """NAIVE version (shipped): one LLM call per ticket per run, no validation."""
-    rows = []
-    for ticket_id, text in live_tickets(con):
+    """Cached, validated LLM labelling.
+
+    Cache key = (hash(input), model, prompt version). Every raw answer is cached —
+    valid or not — so a re-run makes 0 calls; a new PROMPT_VERSION misses the cache
+    and re-labels every ticket on purpose. Gold only gets answers that parse to an
+    allowed label; the rest go to llm_label_quarantine with the raw text.
+    """
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_cache (
+        input_hash VARCHAR, model VARCHAR, prompt_version VARCHAR,
+        raw_response VARCHAR, label VARCHAR,
+        PRIMARY KEY (input_hash, model, prompt_version))""")
+
+    tickets = [(tid, text, input_hash(text)) for tid, text in live_tickets(con)]
+    cached = {h for (h,) in con.execute(
+        "SELECT input_hash FROM llm_label_cache WHERE model = ? AND prompt_version = ?",
+        [MODEL, PROMPT_VERSION]).fetchall()}
+    misses = {h: text for _, text, h in tickets if h not in cached}   # same text -> 1 call
+
+    # Rule 3: estimate the cost of what we are about to call, before calling.
+    est_tokens = estimate_tokens(list(misses.values()))
+    est_usd = est_tokens / 1000 * PRICE_PER_1K_TOKENS_USD
+
+    calls_before = llm.calls
+    for h, text in sorted(misses.items()):
         raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
-        rows.append((ticket_id, raw, MODEL, PROMPT_VERSION))
-    con.execute("""CREATE OR REPLACE TABLE gold_ticket_labels (
-        ticket_id VARCHAR, label VARCHAR, model VARCHAR, prompt_version VARCHAR)""")
-    if rows:
-        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", rows)
-    return {"labeled": len(rows), "calls": llm.calls}
+        con.execute("INSERT INTO llm_label_cache VALUES (?, ?, ?, ?, ?)",
+                    [h, MODEL, PROMPT_VERSION, raw, parse_label(raw)])
+
+    # Gold + quarantine are rebuilt from the cache for the current model/prompt
+    # (overwrite, deterministic) -> idempotent, and every row carries its version.
+    con.execute("CREATE OR REPLACE TEMP TABLE _live (ticket_id VARCHAR, input_hash VARCHAR)")
+    if tickets:
+        con.executemany("INSERT INTO _live VALUES (?, ?)", [(t, h) for t, _, h in tickets])
+    joined = """FROM _live l JOIN llm_label_cache c
+                  ON c.input_hash = l.input_hash AND c.model = ? AND c.prompt_version = ?"""
+    con.execute(f"""
+        CREATE OR REPLACE TABLE gold_ticket_labels AS
+        SELECT l.ticket_id, c.label, c.model, c.prompt_version, c.input_hash
+        {joined} WHERE c.label IS NOT NULL ORDER BY l.ticket_id
+    """, [MODEL, PROMPT_VERSION])
+    con.execute(f"""
+        CREATE OR REPLACE TABLE llm_label_quarantine AS
+        SELECT l.ticket_id, c.model, c.prompt_version, c.input_hash,
+               'off-schema answer' AS reason, c.raw_response
+        {joined} WHERE c.label IS NULL ORDER BY l.ticket_id
+    """, [MODEL, PROMPT_VERSION])
+
+    (n_gold,) = con.execute("SELECT count(*) FROM gold_ticket_labels").fetchone()
+    (n_q,) = con.execute("SELECT count(*) FROM llm_label_quarantine").fetchone()
+    return {"live": len(tickets), "calls": llm.calls - calls_before,
+            "cache_hits": len(tickets) - len(misses), "labeled": n_gold,
+            "quarantined": n_q, "est_tokens": est_tokens, "est_usd": round(est_usd, 6)}
